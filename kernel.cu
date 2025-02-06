@@ -1,4 +1,5 @@
 #include <fstream>
+#include <stdio.h>
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
 #include <thrust/functional.h>
@@ -9,7 +10,7 @@
 #include <thrust/sequence.h>
 #include <thrust/transform_reduce.h>
 
-#define MAX_GRAPHS (1 << 20)
+#define MAX_GRAPHS (1 << 28)
 #define THREADS_PER_BLOCK 256
 #define MAX_NODES 16
 #define MAX_EDGES (MAX_NODES * MAX_NODES)
@@ -38,6 +39,22 @@
     auto tmpb = (b);                                                           \
     tmpa > tmpb ? tmpa : tmpb;                                                 \
   })
+
+struct Pair {
+  size_t graph;
+  size_t cost;
+
+  __host__ __device__ Pair(size_t graph, size_t cost)
+      : graph(graph), cost(cost) {}
+
+  __host__ __device__ Pair() : graph(0), cost(0) {}
+
+  __host__ __device__ Pair operator=(Pair other) {
+    this->graph = other.graph;
+    this->cost = other.cost;
+    return *this;
+  }
+};
 
 __host__ __device__ size_t choose(size_t n, size_t r) {
   size_t a = min(n - r, r);
@@ -157,10 +174,58 @@ __device__ bool is_connected(size_t n_nodes, size_t n_edges, size_t *srcs,
   return n_connected(0, n_nodes, n_edges, srcs, dsts) == n_nodes;
 }
 
-__global__ void project_tm_to_graph(size_t offset, uint32_t *out,
-                                    size_t *elist_src, size_t *elist_dst,
-                                    size_t n_graphs, size_t n_nodes,
-                                    size_t n_edges) {
+__device__ size_t distance(size_t src, size_t dst, size_t n_edges, size_t *srcs,
+                           size_t *dsts) {
+  // count how many nodes a DFS rooted at `root` reaches
+  size_t frontier[MAX_EDGES];
+  size_t frontier_start = 0;
+  size_t frontier_end = 0;
+  size_t dist[MAX_EDGES];
+
+  size_t visited[MAX_NODES];
+  size_t visited_len = 0;
+
+  frontier[0] = src;
+  dist[0] = 0;
+  frontier_end++;
+
+  while (frontier_start != frontier_end) {
+    size_t nid = frontier[frontier_start];
+    size_t d = dist[frontier_start];
+    if (contains(visited, visited_len, nid)) {
+      continue;
+    }
+    visited[visited_len++] = nid;
+
+    if (nid == dst) {
+      return d;
+    }
+    frontier_start = (frontier_start + 1) % MAX_EDGES;
+
+    for (size_t i = 0; i < n_edges; i++) {
+      if (srcs[i] == nid) {
+        if (!contains(visited, visited_len, dsts[i])) {
+          frontier[frontier_end] = dsts[i];
+          dist[frontier_end] = d + 1;
+          frontier_end = (frontier_end + 1) % MAX_EDGES;
+        }
+      } else if (dsts[i] == nid) {
+        if (!contains(visited, visited_len, srcs[i])) {
+          frontier[frontier_end] = srcs[i];
+          dist[frontier_end] = d + 1;
+          frontier_end = (frontier_end + 1) % MAX_EDGES;
+        }
+      }
+    }
+  }
+
+  return n_edges + 1;
+}
+
+__global__ void project_tm_to_graph(size_t offset, Pair *out,
+                                    size_t *traffix_matrix, size_t *elist_src,
+                                    size_t *elist_dst, size_t n_graphs,
+                                    size_t n_nodes, size_t n_edges) {
   size_t i = blockDim.x * blockIdx.x + threadIdx.x;
   if (i > n_graphs) {
     // This index is invalid, and doesn't correspond to a valid graph
@@ -183,9 +248,18 @@ __global__ void project_tm_to_graph(size_t offset, uint32_t *out,
   }
 
   if (!is_connected(n_nodes, n_edges, src, dst)) {
-    out[i] = 0;
+    out[i] = Pair(i, 0);
   } else {
-    out[i] = 1;
+    size_t cost = 0;
+    for (size_t src_nid = 0; src_nid < n_nodes; src_nid++) {
+      for (size_t dst_nid = src_nid + 1; dst_nid < n_nodes; dst_nid++) {
+        auto n_hops = distance(src_nid, dst_nid, n_edges, src, dst);
+        cost += n_hops * traffix_matrix[src_nid * n_nodes + dst_nid];
+        cost += n_hops * traffix_matrix[dst_nid * n_nodes + src_nid];
+      }
+    }
+
+    out[i] = Pair(i, cost);
   }
 }
 
@@ -204,6 +278,36 @@ __host__ std::vector<std::string> split(std::string s, std::string delimiter) {
   return res;
 }
 
+struct mingraph {
+  using T = struct Pair;
+  /*! \typedef first_argument_type
+   *  \brief The type of the function object's first argument.
+   */
+  typedef T first_argument_type;
+
+  /*! \typedef second_argument_type
+   *  \brief The type of the function object's second argument.
+   */
+  typedef T second_argument_type;
+
+  /*! \typedef result_type
+   *  \brief The type of the function object's result;
+   */
+  typedef T result_type;
+
+  __thrust_exec_check_disable__ __host__ __device__ struct Pair
+  operator()(const T &lhs, const T &rhs) const {
+    if (lhs.cost == 0) {
+      return rhs;
+    }
+
+    if (rhs.cost == 0) {
+      return lhs;
+    }
+    return (lhs.cost < rhs.cost) ? lhs : rhs;
+  }
+};
+
 int main(int argc, char **argv) {
   cudaError_t err;
 
@@ -220,10 +324,7 @@ int main(int argc, char **argv) {
   printf("n_edges = %zu\n", n_edges);
 
   // Read the input matrix to be projected onto each graph
-  std::vector<std::vector<size_t>> traffic_matrix(n_nodes);
-  for (size_t i = 0; i < n_nodes; i++) {
-    traffic_matrix[i] = std::vector<size_t>(n_nodes);
-  }
+  std::vector<size_t> traffic_matrix(n_nodes * n_nodes);
 
   std::ifstream ifile(filename);
   std::string str;
@@ -231,23 +332,24 @@ int main(int argc, char **argv) {
   while (std::getline(ifile, str)) {
     auto parts = split(str, " ");
     for (size_t dst = 0; dst < parts.size(); dst++) {
-      traffic_matrix[src][dst] += atoi(parts[dst].c_str());
+      traffic_matrix[src * n_nodes + dst] += atoi(parts[dst].c_str());
     }
     src++;
   }
 
-  thrust::device_vector<size_t> tm(n_nodes * n_nodes);
-  for (size_t i = 0; i < n_nodes; i++) {
-    for (size_t j = 0; j < n_nodes; j++) {
-      tm[i * n_nodes + j] = traffic_matrix[i][j];
-    }
+  size_t *tm = (size_t *)CuAlloc(sizeof(size_t) * n_nodes * n_nodes);
+  err = cudaMemcpy(tm, traffic_matrix.data(),
+                   sizeof(size_t) * traffic_matrix.size(),
+                   cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    exit(EXIT_FAILURE);
   }
 
   printf("n_graphs = %zu C %zu\n", n_total_edges, n_edges);
   size_t n_graphs = choose(n_total_edges, n_edges);
   printf("n_graphs = %zu\n", n_graphs);
 
-  uint32_t *output = (uint32_t *)CuAlloc(sizeof(uint32_t) * MAX_GRAPHS);
+  Pair *output = (Pair *)CuAlloc(sizeof(Pair) * MAX_GRAPHS);
   printf("Allocated output vector\n");
 
   std::vector<size_t> srcs;
@@ -274,7 +376,9 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  size_t acc = 0;
+  auto min_fn = mingraph();
+
+  Pair acc = Pair(0, 0);
 
   for (size_t offset = 0; offset < n_graphs; offset += MAX_GRAPHS) {
     size_t n_graphs_iter = min(MAX_GRAPHS, n_graphs - offset);
@@ -286,17 +390,19 @@ int main(int argc, char **argv) {
     // blocksPerGrid,
     //        threadsPerBlock);
     project_tm_to_graph<<<blocksPerGrid, threadsPerBlock>>>(
-        offset, output, dev_src_list, dev_dst_list, n_graphs, n_nodes, n_edges);
+        offset, output, tm, dev_src_list, dev_dst_list, n_graphs, n_nodes,
+        n_edges);
 
     // Wrap raw ptr with a device_ptr so that we can call thrust::reduce below
-    thrust::device_ptr<uint32_t> dev_ptr = thrust::device_pointer_cast(output);
+    thrust::device_ptr<Pair> dev_ptr = thrust::device_pointer_cast(output);
 
     // Get the number of connected graphs by summing up the output
     // TODO eventually the kernel will return the cost of projecting the traffic
     // matrix onto the graph being evaluated - we'll do a custom reduction op
     // that does a min but also tells us which graph produced the minimum cost
-    auto x = thrust::reduce(dev_ptr, dev_ptr + n_graphs_iter, 0,
-                            thrust::plus<uint32_t>());
+    thrust::plus<size_t>();
+    auto x =
+        thrust::reduce(dev_ptr, dev_ptr + n_graphs_iter, Pair(0, 0), min_fn);
 
     // Copy results to host
     // size_t *host_output = (size_t *)malloc(sizeof(size_t) * n_graphs);
@@ -313,11 +419,11 @@ int main(int argc, char **argv) {
     //   printf(" graph[%zu] is connected? %zu\n ", i, host_output[i]);
     // }
 
-    acc += (size_t)x;
     printf("Remaining %zu\n", n_graphs - offset);
+    acc = min_fn(acc, x);
   }
   cudaFree(dev_src_list);
   cudaFree(dev_dst_list);
   cudaFree(output);
-  printf("x=%zu\n", acc);
+  printf("min graph[%zu] has cost %zub\n", acc.graph, acc.cost);
 }
