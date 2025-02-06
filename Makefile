@@ -1,13 +1,13 @@
 .PHONY: clean
 .PHONY: all
 
-all: kernel kernel.ptx
+all: graphfinder graphfinder.ptx
 
-kernel: kernel.cu
-	nvcc -o kernel kernel.cu
+graphfinder: graphfinder.cu
+	nvcc -o graphfinder graphfinder.cu
 
-kernel.ptx: kernel.cu
-	nvcc -O0 -o kernel.ptx kernel.cu -ptx -src-in-ptx
+graphfinder.ptx: graphfinder.cu
+	nvcc -O0 -o graphfinder.ptx graphfinder.cu -ptx -src-in-ptx
 
 clean:
-	rm -vf kernel kernel.ptx
+	rm -vf graphfinder graphfinder.ptx

@@ -9,8 +9,11 @@ Given:
 `graphfinder` will find the topology connecting `n` routers with `r` links
 that minimizes the total number of bytes sent for the workload `tm`.
 
+See `tm.txt` for example traffic matrix.
+
 ## Status
 
 Currently `graphfinder` aims to be a GPU accelerated brute force search so
-that I compare other strategies/heuristic approximations to the optimal
-solution.
+that I can compare other strategies/heuristic approximations to the optimal
+solution. My next step will be to try a greedy algorithm and compare the
+solutions.
