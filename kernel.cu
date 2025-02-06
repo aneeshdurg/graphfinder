@@ -98,8 +98,9 @@ def combination_at_idx(idx, elems, r):
     return [elems[0]] + combination_at_idx(idx, elems[1:], r - 1)
 */
 
-__device__ void combination_at_idx(size_t idx, size_t *elems_out,
-                                   size_t first_elem, size_t n, size_t r) {
+__host__ __device__ void combination_at_idx(size_t idx, size_t *elems_out,
+                                            size_t first_elem, size_t n,
+                                            size_t r) {
   if (first_elem == (n - r)) {
     for (size_t i = 0; i < r; i++) {
       elems_out[i] = first_elem + i;
@@ -174,54 +175,6 @@ __device__ bool is_connected(size_t n_nodes, size_t n_edges, size_t *srcs,
   return n_connected(0, n_nodes, n_edges, srcs, dsts) == n_nodes;
 }
 
-__device__ size_t distance(size_t src, size_t dst, size_t n_edges, size_t *srcs,
-                           size_t *dsts) {
-  // count how many nodes a DFS rooted at `root` reaches
-  size_t frontier[MAX_EDGES];
-  size_t frontier_start = 0;
-  size_t frontier_end = 0;
-  size_t dist[MAX_EDGES];
-
-  size_t visited[MAX_NODES];
-  size_t visited_len = 0;
-
-  frontier[0] = src;
-  dist[0] = 0;
-  frontier_end++;
-
-  while (frontier_start != frontier_end) {
-    size_t nid = frontier[frontier_start];
-    size_t d = dist[frontier_start];
-    if (contains(visited, visited_len, nid)) {
-      continue;
-    }
-    visited[visited_len++] = nid;
-
-    if (nid == dst) {
-      return d;
-    }
-    frontier_start = (frontier_start + 1) % MAX_EDGES;
-
-    for (size_t i = 0; i < n_edges; i++) {
-      if (srcs[i] == nid) {
-        if (!contains(visited, visited_len, dsts[i])) {
-          frontier[frontier_end] = dsts[i];
-          dist[frontier_end] = d + 1;
-          frontier_end = (frontier_end + 1) % MAX_EDGES;
-        }
-      } else if (dsts[i] == nid) {
-        if (!contains(visited, visited_len, srcs[i])) {
-          frontier[frontier_end] = srcs[i];
-          dist[frontier_end] = d + 1;
-          frontier_end = (frontier_end + 1) % MAX_EDGES;
-        }
-      }
-    }
-  }
-
-  return n_edges + 1;
-}
-
 __global__ void project_tm_to_graph(size_t offset, Pair *out,
                                     size_t *traffix_matrix, size_t *elist_src,
                                     size_t *elist_dst, size_t n_graphs,
@@ -250,16 +203,46 @@ __global__ void project_tm_to_graph(size_t offset, Pair *out,
   if (!is_connected(n_nodes, n_edges, src, dst)) {
     out[i] = Pair(i, 0);
   } else {
+
+
+    // Floyd Warshall Algorithm
+    size_t min_dists[MAX_EDGES];
+
+    for (size_t src_nid = 0; src_nid < n_nodes; src_nid++) {
+      for (size_t dst_nid = 0; dst_nid < n_nodes; dst_nid++) {
+        min_dists[src_nid * n_nodes + dst_nid] = n_edges + 1;
+      }
+    }
+
+    for (size_t eid = 0; eid < n_edges; eid++) {
+      size_t src_nid = src[eid];
+      size_t dst_nid = dst[eid];
+
+      min_dists[src_nid * n_nodes + dst_nid] = 1;
+      min_dists[dst_nid * n_nodes + src_nid] = 1;
+    }
+
+    for (size_t i_node = 0; i_node < n_nodes; i_node++) {
+      for (size_t src_nid = 0; src_nid < n_nodes; src_nid++) {
+        for (size_t dst_nid = (src_nid + 1); dst_nid < n_nodes; dst_nid++) {
+          min_dists[src_nid * n_nodes + dst_nid] =
+              min(min_dists[src_nid * n_nodes + dst_nid],
+                  min_dists[src_nid * n_nodes + i_node] +
+                      min_dists[i_node * n_nodes + dst_nid]);
+        }
+      }
+    }
+
     size_t cost = 0;
     for (size_t src_nid = 0; src_nid < n_nodes; src_nid++) {
       for (size_t dst_nid = src_nid + 1; dst_nid < n_nodes; dst_nid++) {
-        auto n_hops = distance(src_nid, dst_nid, n_edges, src, dst);
+        auto n_hops = min_dists[src_nid * n_nodes + dst_nid];
         cost += n_hops * traffix_matrix[src_nid * n_nodes + dst_nid];
         cost += n_hops * traffix_matrix[dst_nid * n_nodes + src_nid];
       }
     }
 
-    out[i] = Pair(i, cost);
+    out[i] = Pair(offset + i, cost);
   }
 }
 
@@ -426,4 +409,12 @@ int main(int argc, char **argv) {
   cudaFree(dev_dst_list);
   cudaFree(output);
   printf("min graph[%zu] has cost %zub\n", acc.graph, acc.cost);
+
+  printf("  graph[%zu] = [", acc.graph);
+  size_t g[MAX_EDGES];
+  combination_at_idx(acc.graph, g, 0, n_total_edges, n_edges);
+  for (size_t eid = 0; eid < n_edges; eid++) {
+    printf(" (%zu, %zu)", srcs[g[eid]], dsts[g[eid]]);
+  }
+  printf(" ]\n");
 }
