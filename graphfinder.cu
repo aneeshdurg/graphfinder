@@ -1,3 +1,12 @@
+/**
+ * Given a number of routers N, a number of links R, and a NxN traffic matrix TM
+ * where TM[i][j] is the number of bytes sent from router i to router j,
+ * Find G, the topology with N nodes and R edges such that the cost of sending
+ * the data in TM is minimized, where the cost is defined as the total number
+ * of bytes sent by all routers when traffic is routed by a shortest-path
+ * policy.
+ */
+
 #include <fstream>
 #include <stdio.h>
 #include <thrust/device_vector.h>
@@ -12,6 +21,9 @@
 
 #define MAX_GRAPHS (1 << 28)
 #define THREADS_PER_BLOCK 256
+
+// To allow static allocation of data structures on the stack of GPU threads, we
+// set a constant MAX_NODES that this program accepts here.
 #define MAX_NODES 16
 #define MAX_EDGES (MAX_NODES * MAX_NODES)
 
@@ -40,6 +52,8 @@
     tmpa > tmpb ? tmpa : tmpb;                                                 \
   })
 
+// Tuple of graph id and cost, this can't just be a std::pair because std::pair
+// isn't defined with __device__.
 struct Pair {
   size_t graph;
   size_t cost;
@@ -204,7 +218,6 @@ __global__ void project_tm_to_graph(size_t offset, Pair *out,
     out[i] = Pair(i, 0);
   } else {
 
-
     // Floyd Warshall Algorithm
     size_t min_dists[MAX_EDGES];
 
@@ -299,7 +312,12 @@ int main(int argc, char **argv) {
   size_t n_nodes = atoi(argv[1]);
   size_t n_edges = atoi(argv[2]);
   size_t n_total_edges = n_nodes * (n_nodes - 1) / 2;
+  // Connected graphs need at least N - 1 edges
+  assert(n_edges > (n_nodes - 1));
+  // Check that n_edges isn't more than the number of possible edges because we
+  // aren't considering multigraphs
   assert(n_edges <= n_total_edges);
+  assert(n_nodes <= MAX_NODES);
 
   char const *filename = argv[3];
 
@@ -315,11 +333,13 @@ int main(int argc, char **argv) {
   while (std::getline(ifile, str)) {
     auto parts = split(str, " ");
     for (size_t dst = 0; dst < parts.size(); dst++) {
-      traffic_matrix[src * n_nodes + dst] += atoi(parts[dst].c_str());
+      traffic_matrix[src * n_nodes + dst] +=
+          strtoul(parts[dst].c_str(), NULL, 10);
     }
     src++;
   }
 
+  // Copy traffic matrix to GPU
   size_t *tm = (size_t *)CuAlloc(sizeof(size_t) * n_nodes * n_nodes);
   err = cudaMemcpy(tm, traffic_matrix.data(),
                    sizeof(size_t) * traffic_matrix.size(),
@@ -328,13 +348,20 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
+  // Count the total number of graphs with n_nodes nodes and n_edges edges
   printf("n_graphs = %zu C %zu\n", n_total_edges, n_edges);
   size_t n_graphs = choose(n_total_edges, n_edges);
   printf("n_graphs = %zu\n", n_graphs);
 
+  // allocate output buffer (pair of graph-id, cost of projection) - for large
+  // values of n_nodes we can't allocate a large enough buffer, so instead we
+  // choose a fixed size output and process one chunk of graphs at a time.
   Pair *output = (Pair *)CuAlloc(sizeof(Pair) * MAX_GRAPHS);
   printf("Allocated output vector\n");
 
+  // Create a mapping from edge ids in [0, n_total_edges) to (src, dst)
+  // i.e. the edge with id eid's source and dest is given by srcs[eid],
+  // dsts[eid] respectively.
   std::vector<size_t> srcs;
   std::vector<size_t> dsts;
   for (size_t i = 0; i < n_nodes; i++) {
@@ -359,19 +386,18 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
+  // Comparator for finding the minimum element in output
   auto min_fn = mingraph();
 
-  Pair acc = Pair(0, 0);
+  // Min element so far
+  Pair acc = Pair();
 
   for (size_t offset = 0; offset < n_graphs; offset += MAX_GRAPHS) {
+    // Number of graphs processed by this iteration
     size_t n_graphs_iter = min(MAX_GRAPHS, n_graphs - offset);
 
-    // Launch the Vector Add CUDA Kernel
     int threadsPerBlock = THREADS_PER_BLOCK;
     int blocksPerGrid = (n_graphs_iter + threadsPerBlock - 1) / threadsPerBlock;
-    // printf("CUDA kernel launch with %d blocks of %d threads\n",
-    // blocksPerGrid,
-    //        threadsPerBlock);
     project_tm_to_graph<<<blocksPerGrid, threadsPerBlock>>>(
         offset, output, tm, dev_src_list, dev_dst_list, n_graphs, n_nodes,
         n_edges);
@@ -379,15 +405,11 @@ int main(int argc, char **argv) {
     // Wrap raw ptr with a device_ptr so that we can call thrust::reduce below
     thrust::device_ptr<Pair> dev_ptr = thrust::device_pointer_cast(output);
 
-    // Get the number of connected graphs by summing up the output
-    // TODO eventually the kernel will return the cost of projecting the traffic
-    // matrix onto the graph being evaluated - we'll do a custom reduction op
-    // that does a min but also tells us which graph produced the minimum cost
-    thrust::plus<size_t>();
-    auto x =
+    // Get the minimum graph-id and the associated cost for the current chunk
+    auto curr_min =
         thrust::reduce(dev_ptr, dev_ptr + n_graphs_iter, Pair(0, 0), min_fn);
 
-    // Copy results to host
+    // Copy results to host (for debugging)
     // size_t *host_output = (size_t *)malloc(sizeof(size_t) * n_graphs);
     // err = cudaMemcpy(host_output, output, sizeof(size_t) * n_graphs,
     //                  cudaMemcpyDeviceToHost);
@@ -397,19 +419,23 @@ int main(int argc, char **argv) {
     //           cudaGetErrorString(err));
     //   exit(EXIT_FAILURE);
     // }
-
     // for (size_t i = 0; i < n_graphs; i++) {
     //   printf(" graph[%zu] is connected? %zu\n ", i, host_output[i]);
     // }
 
     printf("Remaining %zu\n", n_graphs - offset);
-    acc = min_fn(acc, x);
+    // On the CPU take the minimum value for this chunk and compare it with the
+    // known minimum (if no minimum is known - i.e. cost=0 - then this will
+    // always pick `curr_min`)
+    acc = min_fn(acc, curr_min);
   }
   cudaFree(dev_src_list);
   cudaFree(dev_dst_list);
   cudaFree(output);
-  printf("min graph[%zu] has cost %zub\n", acc.graph, acc.cost);
 
+  printf("min graph[%zu] has cost %zub\n", acc.graph, acc.cost);
+  // Use the graph-id to find the set of edges that formed the minimum cost
+  // solution
   printf("  graph[%zu] = [", acc.graph);
   size_t g[MAX_EDGES];
   combination_at_idx(acc.graph, g, 0, n_total_edges, n_edges);
